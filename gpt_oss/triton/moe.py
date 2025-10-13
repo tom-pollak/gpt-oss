@@ -5,10 +5,10 @@ import triton_kernels
 import triton_kernels.swiglu
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.matmul_ogs import PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
-from triton_kernels.matmul_ogs import matmul_ogs
+from triton_kernels.matmul_ogs import matmul_ogs, RoutingData, GatherIndx, ScatterIndx
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import routing
-from triton_kernels.tensor import convert_layout
+from triton_kernels.topk import topk
+from triton_kernels.tensor import convert_layout, SparseMatrix, make_ragged_tensor_metadata
 from triton_kernels.tensor_details.layout import StridedLayout, HopperMXScaleLayout, HopperMXValueLayout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
 
@@ -31,6 +31,46 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0, interleaved: bool = True
     return out_glu * (x_linear + 1)
 
 
+def legacy_routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act):
+    """
+    Legacy routing helper that constructs routing data from a bitmatrix.
+    This function provides compatibility with the deprecated triton_kernels.routing API.
+    """
+    sparse_logits = SparseMatrix(indx=expt_indx, vals=expt_scal, mask=bitmatrix)
+    dispatch_indx = sparse_logits.mask_metadata.col_sorted_indx
+    combine_indx = sparse_logits.mask_metadata.row_sorted_indx
+    ragged_batch_metadata = make_ragged_tensor_metadata(sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0])
+    gate_scal = sparse_logits.vals.flatten()[combine_indx]
+    routing_data = RoutingData(gate_scal, ragged_batch_metadata.batch_sizes, n_expts_tot, n_expts_act,
+                               ragged_batch_metadata)
+    gather_idx = GatherIndx(combine_indx, dispatch_indx)
+    scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
+    return routing_data, gather_idx, scatter_idx
+
+
+def legacy_routing(logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=None):
+    """
+    Legacy routing function that provides compatibility with the deprecated triton_kernels.routing API.
+
+    Args:
+        logits: Router logits of shape (n_tokens, n_experts)
+        n_expts_act: Number of experts to route each token to
+        sm_first: If True, apply softmax before topk
+        expt_indx: Optional pre-computed expert indices
+        n_rows: Optional number of rows to process
+
+    Returns:
+        routing_data: RoutingData containing gate scales, histograms, and metadata
+        gather_idx: Indices for gathering tokens by expert
+        scatter_idx: Indices for scattering tokens back to original positions
+    """
+    if sm_first:
+        logits = torch.softmax(logits, dim=-1)
+    sparse_logits = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx, n_rows=n_rows)
+    return legacy_routing_from_bitmatrix(sparse_logits.mask, sparse_logits.vals, sparse_logits.indx, logits.shape[-1],
+                                         n_expts_act)
+
+
 def moe(x, wg, w1, w1_mx, w2, w2_mx, bg, b1, b2, experts_per_token=4, num_experts=128, swiglu_limit=7.0, fused_act=True, interleaved=True):
     if x.numel() == 0:
         return x
@@ -42,7 +82,7 @@ def moe(x, wg, w1, w1_mx, w2, w2_mx, bg, b1, b2, experts_per_token=4, num_expert
     with record_function("wg"):
         logits = matmul_ogs(x, wg, bg, precision_config=pcg)
     with record_function("routing"):
-        rdata, gather_indx, scatter_indx = routing(logits, experts_per_token, simulated_ep=1)
+        rdata, gather_indx, scatter_indx = legacy_routing(logits, experts_per_token)
 
     if fused_act:
         assert interleaved, "Fused activation requires interleaved weights"
