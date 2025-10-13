@@ -34,7 +34,23 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0, interleaved: bool = True
 def legacy_routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act):
     """
     Legacy routing helper that constructs routing data from a bitmatrix.
+
     This function provides compatibility with the deprecated triton_kernels.routing API.
+    It's a temporary shim while migrating to the new composable primitives.
+
+    Migration path: This function can be eliminated by inlining its logic directly
+    into the caller and using the SparseMatrix from topk() directly, avoiding the
+    redundant SparseMatrix construction here.
+
+    Args:
+        bitmatrix: Bitmatrix mask from topk
+        expt_scal: Expert scale values (gate weights)
+        expt_indx: Expert indices
+        n_expts_tot: Total number of experts
+        n_expts_act: Active experts per token
+
+    Returns:
+        Tuple of (RoutingData, GatherIndx, ScatterIndx)
     """
     sparse_logits = SparseMatrix(indx=expt_indx, vals=expt_scal, mask=bitmatrix)
     dispatch_indx = sparse_logits.mask_metadata.col_sorted_indx
@@ -52,6 +68,9 @@ def legacy_routing(logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=N
     """
     Legacy routing function that provides compatibility with the deprecated triton_kernels.routing API.
 
+    This is a temporary compatibility shim. The modern approach uses the new composable
+    primitives directly for better control and potential optimization.
+
     Args:
         logits: Router logits of shape (n_tokens, n_experts)
         n_expts_act: Number of experts to route each token to
@@ -63,6 +82,19 @@ def legacy_routing(logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=N
         routing_data: RoutingData containing gate scales, histograms, and metadata
         gather_idx: Indices for gathering tokens by expert
         scatter_idx: Indices for scattering tokens back to original positions
+
+    Modern equivalent:
+        sparse_logits = topk(logits, n_expts_act, apply_softmax=True)
+        dispatch_indx = sparse_logits.mask_metadata.col_sorted_indx
+        combine_indx = sparse_logits.mask_metadata.row_sorted_indx
+        ragged_batch_metadata = make_ragged_tensor_metadata(
+            sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
+        )
+        gate_scal = sparse_logits.vals.flatten()[combine_indx]
+        routing_data = RoutingData(gate_scal, ragged_batch_metadata.batch_sizes,
+                                   n_expts_tot, n_expts_act, ragged_batch_metadata)
+        gather_idx = GatherIndx(combine_indx, dispatch_indx)
+        scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
     """
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
@@ -72,6 +104,35 @@ def legacy_routing(logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=N
 
 
 def moe(x, wg, w1, w1_mx, w2, w2_mx, bg, b1, b2, experts_per_token=4, num_experts=128, swiglu_limit=7.0, fused_act=True, interleaved=True):
+    """
+    Mixture of Experts layer with MX4 quantization and fused SwiGLU activation.
+
+    This implementation uses the legacy routing API for compatibility with older
+    triton_kernels. For a more modern approach with better composability:
+    - Use topk() directly to get sparse_logits with bitmatrix metadata
+    - Access sparse_logits.mask_metadata for routing indices
+    - Build RoutingData, GatherIndx, ScatterIndx explicitly
+    See legacy_routing() docstring for the modern equivalent code.
+
+    Args:
+        x: Input tensor
+        wg: Gate/router weights
+        w1: First expert weights
+        w1_mx: MX4 scales for w1
+        w2: Second expert weights
+        w2_mx: MX4 scales for w2
+        bg: Gate bias
+        b1: First expert bias
+        b2: Second expert bias
+        experts_per_token: Number of experts to route each token to (top-k)
+        num_experts: Total number of experts
+        swiglu_limit: Clipping limit for SwiGLU activation
+        fused_act: Whether to use fused SwiGLU activation
+        interleaved: Whether expert weights are interleaved
+
+    Returns:
+        Output tensor after MoE computation
+    """
     if x.numel() == 0:
         return x
 
@@ -82,6 +143,7 @@ def moe(x, wg, w1, w1_mx, w2, w2_mx, bg, b1, b2, experts_per_token=4, num_expert
     with record_function("wg"):
         logits = matmul_ogs(x, wg, bg, precision_config=pcg)
     with record_function("routing"):
+        # Using legacy routing API for now - see function docstring for modern approach
         rdata, gather_indx, scatter_indx = legacy_routing(logits, experts_per_token)
 
     if fused_act:
