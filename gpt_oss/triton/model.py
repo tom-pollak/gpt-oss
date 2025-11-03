@@ -495,7 +495,7 @@ class TokenGenerator:
         self.model(prompt_tokens[None, :-1], self.caches)
         predicted_token = prompt_tokens[-1]
         num_generated_tokens = 0
-        while max_tokens == 0 or num_generated_tokens < max_tokens:
+        while max_tokens in (0, None) or num_generated_tokens < max_tokens:
             self.input_token[0] = predicted_token
             self.graph.replay()
             if temperature == 0.0:
