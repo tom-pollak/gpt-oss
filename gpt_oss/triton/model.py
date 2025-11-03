@@ -489,25 +489,32 @@ class TokenGenerator:
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
         stop_tokens = stop_tokens or []
-        for cache in self.caches:
-            cache.reset()
-        prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
-        self.model(prompt_tokens[None, :-1], self.caches)
-        predicted_token = prompt_tokens[-1]
+        with record_function("cache_reset"):
+            for cache in self.caches:
+                cache.reset()
+
+        with record_function("prepare_prompt"):
+            prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
+            self.model(prompt_tokens[None, :-1], self.caches)
+            predicted_token = prompt_tokens[-1]
+
         num_generated_tokens = 0
         while max_tokens in (0, None) or num_generated_tokens < max_tokens:
             self.input_token[0] = predicted_token
-            self.graph.replay()
-            if temperature == 0.0:
-                predicted_token = torch.argmax(self.logits[-1, :], dim=-1).item()
-            else:
-                probs = torch.softmax(self.logits * (1.0 / temperature), dim=-1)
-                predicted_token = torch.multinomial(probs[-1, :], num_samples=1).item()
+            with record_function("graph_replay"):
+                self.graph.replay()
+            with record_function("sampling"):
+                if temperature == 0.0:
+                    predicted_token = torch.argmax(self.logits[-1, :], dim=-1).item()
+                else:
+                    probs = torch.softmax(self.logits * (1.0 / temperature), dim=-1)
+                    predicted_token = torch.multinomial(probs[-1, :], num_samples=1).item()
             num_generated_tokens += 1
 
             if return_logprobs:
-                logprobs = torch.log_softmax(self.logits[-1, :], dim=-1)
-                selected_logprobs = logprobs[predicted_token].item()
+                with record_function("calc_logprobs"):
+                    logprobs = torch.log_softmax(self.logits[-1, :], dim=-1)
+                    selected_logprobs = logprobs[predicted_token].item()
                 yield predicted_token, selected_logprobs
             else:
                 yield predicted_token

@@ -6,6 +6,7 @@
 import argparse
 
 from gpt_oss.tokenizer import get_tokenizer
+from torch.profiler import profile, ProfilerActivity
 
 
 def main(args):
@@ -29,12 +30,14 @@ def main(args):
     tokenizer = get_tokenizer()
     tokens = tokenizer.encode(args.prompt)
     max_tokens = None if args.limit == 0 else args.limit
-    for token, logprob in generator.generate(tokens, stop_tokens=[tokenizer.eot_token], temperature=args.temperature, max_tokens=max_tokens, return_logprobs=True):
-        tokens.append(token)
-        token_text = tokenizer.decode([token])
-        print(
-            f"Generated token: {repr(token_text)}, logprob: {logprob}"
-        )
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+        for token, logprob in generator.generate(tokens, stop_tokens=[tokenizer.eot_token], temperature=args.temperature, max_tokens=max_tokens, return_logprobs=True):
+            tokens.append(token)
+            token_text = tokenizer.decode([token])
+            print(
+                f"Generated token: {repr(token_text)}, logprob: {logprob}"
+            )
+    prof.export_chrome_trace("gpt-oss-120b-trace.json")
 
 
 if __name__ == "__main__":
