@@ -37,7 +37,7 @@ def main(args):
             print(
                 f"Generated token: {repr(token_text)}, logprob: {logprob}"
             )
-    prof.export_chrome_trace("gpt-oss-120b-trace.json")
+    prof.export_chrome_trace(args.profile)
 
 
 if __name__ == "__main__":
@@ -92,6 +92,12 @@ if __name__ == "__main__":
         type=int,
         default=4096,
         help="Context length for Triton backend",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        help="Output path for PyTorch profile trace",
+        required=True,
     )
     args = parser.parse_args()
 

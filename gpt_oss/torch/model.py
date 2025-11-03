@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 
 from gpt_oss.torch.weights import Checkpoint
 
@@ -214,22 +215,24 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
+    @record_function("attn")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
-        qkv = self.qkv(t)
-        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-        k = qkv[
-            :,
-            self.num_attention_heads
-            * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
-        v = qkv[
-            :,
-            (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
+        with record_function("qkv"):
+            qkv = self.qkv(t)
+            q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
+            k = qkv[
+                :,
+                self.num_attention_heads
+                * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
+                * self.head_dim,
+            ].contiguous()
+            v = qkv[
+                :,
+                (self.num_attention_heads + self.num_key_value_heads)
+                * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
+                * self.head_dim,
+            ].contiguous()
 
         q = q.view(
             -1,
@@ -239,9 +242,12 @@ class AttentionBlock(torch.nn.Module):
         )
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
-        t = self.out(t)
+        with record_function("rope"):
+            q, k = self.rope(q, k)
+        with record_function("attn_kernel"):
+            t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
+        with record_function("c_proj"):
+            t = self.out(t)
         t = x + t
         return t
 
@@ -309,6 +315,7 @@ class MLPBlock(torch.nn.Module):
             )
         )
 
+    @record_function("mlp")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         g = self.gate(t)
@@ -380,11 +387,15 @@ class Transformer(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
+        with record_function("embedding"):
+            x = self.embedding(x)
         for block in self.block:
-            x = block(x)
-        x = self.norm(x)
-        x = self.unembedding(x)
+            with record_function("block"):
+                x = block(x)
+        with record_function("norm_f"):
+            x = self.norm(x)
+        with record_function("unembedding"):
+            x = self.unembedding(x)
         return x
 
     @staticmethod
